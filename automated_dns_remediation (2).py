@@ -27,115 +27,39 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from enumerate_devices import enumerate_devices
 from monitor_device_availability import has_static_ip, ping_device
 
-
-# ============================================================
-# Configuration
-# ============================================================
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(SCRIPT_DIR, "network_devices.csv")
-
 TICKET_URL = f"{HELPDESK_BASE_URL}/api/tickets"
 
-# These are the DNS servers that are considered correct
-EXPECTED_DNS = [
-    "10.10.10.10",
-    "10.10.10.20",
-]
+EXPECTED_DNS = ["10.10.10.10", "10.10.10.20"]
 
-# This must match the issue type used by the helpdesk service
-ISSUE_TYPE = "DNS Compromise"
-
-
-# ============================================================
-# Device selection
-# ============================================================
 
 def get_monitored_devices():
-    """
-    Resolve DHCP devices and return devices that can be monitored.
-
-    Devices without a usable IP are skipped.
-    Open vSwitch devices are skipped.
-    Devices without credentials are skipped.
-    """
-
     devices = enumerate_devices(CSV_FILE)
-
     monitored = []
+    for d in devices:
+        addr = d.get("Device Address", "").strip()
+        os_type = d.get("OS", "").strip().lower()
+        user = d.get("Username", "").strip().lower()
+        name = d.get("Device Name", "").strip().lower()
 
-    for device in devices:
-
-        address = device.get(
-            "Device Address",
-            ""
-        ).strip()
-
-        os_type = device.get(
-            "OS",
-            ""
-        ).strip().lower()
-
-        username = device.get(
-            "Username",
-            ""
-        ).strip().lower()
-
-        # Skip devices without usable addresses
-        if not has_static_ip(address):
+        # Check static IP and credentials
+        if not has_static_ip(addr) or user in ("", "none"):
             continue
 
-        # Skip switches
-        if os_type in (
-            "openvswitch",
-            "switch",
-        ):
+        # Skip switches and routers by OS or device name
+        if "switch" in os_type or "router" in os_type or "vyos" in os_type or "router" in name:
             continue
 
-        # Skip devices without SSH credentials
-        if username in (
-            "",
-            "none",
-        ):
-            continue
-
-        monitored.append(device)
-
+        monitored.append(d)
     return monitored
 
-
-# ============================================================
-# SSH
-# ============================================================
-
-def run_ssh(
-    host,
-    port,
-    username,
-    password,
-    command,
-    timeout=8,
-):
-    """
-    Execute a command over SSH.
-
-    Paramiko is preferred when installed.
-    sshpass is used as a fallback.
-    """
-
-    # --------------------------------------------------------
-    # Try Paramiko first
-    # --------------------------------------------------------
-
+def run_ssh(host, port, username, password, command, timeout=8):
     try:
         import paramiko
 
         client = paramiko.SSHClient()
-
-        client.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy()
-        )
-
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             client.connect(
                 hostname=host,
@@ -146,1362 +70,267 @@ def run_ssh(
                 allow_agent=False,
                 look_for_keys=False,
             )
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
 
-            stdin, stdout, stderr = client.exec_command(
-                command,
-                timeout=timeout,
-            )
+            stdin.close()
+            stdout.close()
+            stderr.close()
 
-            out = stdout.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
-            err = stderr.read().decode(
-                "utf-8",
-                errors="replace",
-            )
+            clean_err = "\n".join([
+                line for line in err.splitlines()
+                if "inappropriate ioctl" not in line.lower()
+                and "no job control" not in line.lower()
+            ]).strip()
 
             if out.strip():
                 return True, out
-
-            if err.strip():
-                return False, err
-
+            if clean_err:
+                return False, clean_err
             return True, ""
-
         finally:
             client.close()
-
-    except ImportError:
+    except Exception:
         pass
 
-    except Exception as exc:
-
-        # If sshpass is unavailable, return the Paramiko error.
-        if not shutil.which("sshpass"):
-            return False, str(exc)
-
-    # --------------------------------------------------------
-    # Fallback to sshpass
-    # --------------------------------------------------------
-
     if shutil.which("sshpass") and password:
-
         command_args = [
-            "sshpass",
-            "-p",
-            password,
-            "ssh",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            f"ConnectTimeout={timeout}",
-            "-p",
-            str(port),
-            f"{username}@{host}",
-            command,
+            "sshpass", "-p", password, "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", f"ConnectTimeout={timeout}",
+            "-p", str(port),
+            f"{username}@{host}", command,
         ]
-
         try:
-
-            result = subprocess.run(
-                command_args,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 5,
-            )
-
-            output = (
-                result.stdout
-                if result.stdout.strip()
-                else result.stderr
-            )
-
-            return (
-                result.returncode == 0,
-                output,
-            )
-
+            res = subprocess.run(command_args, capture_output=True, text=True, timeout=timeout + 4)
+            out = res.stdout if res.stdout.strip() else res.stderr
+            clean_out = "\n".join([
+                line for line in out.splitlines()
+                if "inappropriate ioctl" not in line.lower()
+                and "no job control" not in line.lower()
+            ]).strip()
+            return (res.returncode == 0, clean_out)
         except Exception as exc:
             return False, str(exc)
 
-    return (
-        False,
-        "Neither paramiko nor sshpass is available for SSH.",
-    )
+    return False, "SSH connection failed"
 
-
-# ============================================================
-# DNS Detection
-# ============================================================
-
-def detect_altered_dns(device):
-    """
-    Read the DNS configuration from a device.
-
-    Returns:
-        None
-            DNS is correct, or device cannot be checked.
-
-        str
-            The detected DNS configuration when it differs
-            from EXPECTED_DNS.
-    """
-
-    name = device["Device Name"]
-    ip = device["Device Address"]
-
-    os_type = device.get(
-        "OS",
-        "",
-    ).strip()
-
-    username = device.get(
-        "Username",
-        "",
-    ).strip()
-
-    password = device.get(
-        "Password",
-        "",
-    )
-
-    # VyOS SSH port comes from config.
-    # Other devices use standard SSH port 22.
-    if os_type.lower() == "vyos":
-        port = VYOS_SSH_PORT
-    else:
-        port = 22
-
-    print(
-        f"\n  Checking DNS configuration on "
-        f"{name} ({ip}) [OS: {os_type}]..."
-    )
-
-    # --------------------------------------------------------
-    # Check availability first
-    # --------------------------------------------------------
-
-    if not ping_device(ip):
-
-        print(
-            f"  [SKIP] {name} ({ip}) is offline."
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # Get DNS configuration
-    # --------------------------------------------------------
-
-    if os_type.lower() == "vyos":
-
-        command = (
-            "/bin/vbash -ic "
-            "'show configuration commands | "
-            "match \"system name-server\"'"
-        )
-
-    else:
-
-        command = "cat /etc/resolv.conf"
-
-    success, output = run_ssh(
-        ip,
-        port,
-        username,
-        password,
-        command,
-    )
-
-    if not success:
-
-        print(
-            f"  [WARN] Could not retrieve DNS configuration "
-            f"from {name}:"
-        )
-
-        print(
-            f"         {output.strip()}"
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # Extract IPv4 addresses
-    # --------------------------------------------------------
-
-    detected = re.findall(
-        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-        output,
-    )
-
-    # Remove duplicates while preserving order
-    detected = list(
-        dict.fromkeys(detected)
-    )
-
-    # Ignore localhost DNS
-    active = [
-        dns
-        for dns in detected
-        if not dns.startswith("127.")
-    ]
-
-    print(
-        f"  Current DNS: "
-        f"{', '.join(active) if active else 'None detected'}"
-    )
-
-    print(
-        f"  Expected DNS: "
-        f"{', '.join(EXPECTED_DNS)}"
-    )
-
-    # --------------------------------------------------------
-    # Compare actual DNS against expected DNS
-    # --------------------------------------------------------
-
-    actual_set = set(active)
-    expected_set = set(EXPECTED_DNS)
-
-    if actual_set == expected_set:
-
-        print(
-            f"  [OK] DNS configuration on {name} "
-            f"is correct."
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # DNS configuration is altered
-    # --------------------------------------------------------
-
-    current_dns = (
-        ", ".join(active)
-        if active
-        else "None detected"
-    )
-
-    print(
-        f"  [ALERT] DNS configuration altered "
-        f"on {name}: {current_dns}"
-    )
-
-    return current_dns
-
-
-# ============================================================
-# DNS Alert Email
-# ============================================================
-
-def build_altered_email(
-    device,
-    current_dns,
-    expected_dns,
-    timestamp,
-):
-    """
-    Build the DNS Setting Altered Notification email.
-    """
-
-    name = device["Device Name"]
-    ip = device["Device Address"]
-
-    subject = (
-        f"DNS Configuration Alert: "
-        f"{name} ({ip})"
-    )
-
-    body = f"""Dear Network Administrator,
-
-This is an automated alert that the DNS configuration for the following device has been altered from the expected settings:
-
-Device Name: {name}
-IP Address: {ip}
-Detected DNS Setting: {current_dns}
-Expected DNS Setting: {expected_dns}
-Time Detected: {timestamp}
-
-The system will attempt to automatically correct this configuration.
-
-Best regards,
-Network Monitoring System"""
-
-    return subject, body
-
-
-def send_email(
-    subject,
-    body,
-):
-    """
-    Send the DNS alert email.
-
-    If SMTP is not configured, the email is displayed
-    as a dry run instead.
-    """
-
-    message = MIMEMultipart()
-
-    message["From"] = FROM_EMAIL
-    message["To"] = TO_EMAIL
-    message["Subject"] = subject
-
-    message.attach(
-        MIMEText(
-            body,
-            "plain",
-        )
-    )
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "DNS SETTING ALTERED NOTIFICATION EMAIL"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"From    : {FROM_EMAIL}"
-    )
-
-    print(
-        f"To      : {TO_EMAIL}"
-    )
-
-    print(
-        f"Subject : {subject}"
-    )
-
-    print(
-        "-" * 70
-    )
-
-    print(body)
-
-    print(
-        "=" * 70
-    )
-
-    # --------------------------------------------------------
-    # Dry run
-    # --------------------------------------------------------
-
-    if not SEND_EMAIL or not SMTP_SERVER:
-
-        print(
-            "\n[DRY RUN] Email displayed. "
-            "SMTP is not configured or SEND_EMAIL is disabled."
-        )
-
-        return True
-
-    # --------------------------------------------------------
-    # Send email
-    # --------------------------------------------------------
-
-    try:
-
-        with smtplib.SMTP(
-            SMTP_SERVER,
-            SMTP_PORT,
-            timeout=10,
-        ) as server:
-
-            server.send_message(
-                message
-            )
-
-        print(
-            "\n[OK] Alert email sent successfully."
-        )
-
-        return True
-
-    except Exception as exc:
-
-        print(
-            f"\n[WARN] Failed to send email: {exc}"
-        )
-
-        return False
-
-
-# ============================================================
-# Helpdesk - Get Tickets
-# ============================================================
 
 def get_tickets():
-    """
-    Retrieve tickets from the helpdesk API.
-    """
-
-    headers = {
-        "Accept": "application/json",
-    }
-
+    headers = {"Accept": "application/json"}
     if HELPDESK_TOKEN:
-
-        headers["Authorization"] = (
-            f"Bearer {HELPDESK_TOKEN}"
-        )
-
-    request = urllib.request.Request(
-        TICKET_URL,
-        headers=headers,
-        method="GET",
-    )
-
+        headers["Authorization"] = f"Bearer {HELPDESK_TOKEN}"
     try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=5,
-        ) as response:
-
-            raw = response.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
-            data = json.loads(raw)
-
-            # API may return a list directly
-            if isinstance(data, list):
-                return data
-
-            # Or:
-            # {"tickets": [...]}
-            if isinstance(data, dict):
-
-                tickets = data.get(
-                    "tickets"
-                )
-
-                if isinstance(tickets, list):
-                    return tickets
-
-                # Or:
-                # {"data": [...]}
-                tickets = data.get(
-                    "data"
-                )
-
-                if isinstance(tickets, list):
-                    return tickets
-
-            print(
-                "\n  [WARN] Unexpected ticket API response."
-            )
-
-            return []
-
-    except Exception as exc:
-
-        print(
-            f"\n  [WARN] Ticket service query failed "
-            f"({TICKET_URL}): {exc}"
-        )
-
+        req = urllib.request.Request(TICKET_URL, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+            return data if isinstance(data, list) else data.get("tickets", data.get("data", []))
+    except Exception:
         return []
 
 
-# ============================================================
-# Helpdesk - Find DNS Ticket
-# ============================================================
+def find_dns_ticket(tickets, device):
+    name = device["Device Name"].strip().lower()
+    ip = device["Device Address"].strip()
 
-def find_dns_ticket(
-    tickets,
-    device,
-):
-    """
-    Find an existing OPEN DNS COMPROMISE ticket
-    for the specific device.
-
-    IMPORTANT:
-    This deliberately ignores Device Unavailable tickets.
-    """
-
-    name = (
-        device["Device Name"]
-        .strip()
-        .lower()
-    )
-
-    ip = (
-        device["Device Address"]
-        .strip()
-    )
-
-    for ticket in tickets:
-
-        ticket_name = str(
-            ticket.get(
-                "device_name",
-                "",
-            )
-        ).strip().lower()
-
-        ticket_ip = str(
-            ticket.get(
-                "ip_address",
-                "",
-            )
-        ).strip()
-
-        issue_type = str(
-            ticket.get(
-                "issue_type",
-                "",
-            )
-        ).strip().lower()
-
-        status = str(
-            ticket.get(
-                "status",
-                "",
-            )
-        ).strip().lower()
-
-        # ----------------------------------------------------
-        # Only DNS tickets
-        # ----------------------------------------------------
-
-        if issue_type != ISSUE_TYPE.lower():
+    for t in tickets:
+        if str(t.get("status", "")).lower() == "resolved":
             continue
 
-        # ----------------------------------------------------
-        # Ignore resolved tickets
-        # ----------------------------------------------------
+        title = str(t.get("title", "")).lower()
+        desc = str(t.get("description", "")).lower()
 
-        if status == "resolved":
+        if "dns" not in title and "dns" not in desc:
             continue
 
-        # ----------------------------------------------------
-        # Match device
-        # ----------------------------------------------------
+        title_match = bool(re.search(rf"\b{re.escape(name)}\b", title))
+        desc_match = bool(re.search(rf"\b{re.escape(name)}\s*\({re.escape(ip)}\)", desc))
 
-        if (
-            ticket_name == name
-            or ticket_ip == ip
-        ):
-
-            return ticket
+        if title_match or desc_match:
+            return t
 
     return None
 
 
-# ============================================================
-# Helpdesk - Create DNS Ticket
-# ============================================================
-
-def create_dns_ticket(
-    device,
-    detected_dns,
-):
-    """
-    Create a DNS Compromise ticket when no open
-    DNS ticket already exists.
-    """
-
-    name = device["Device Name"]
-    ip = device["Device Address"]
-
+def resolve_ticket(ticket_id, timestamp):
+    url = f"{TICKET_URL}/{ticket_id}"
     payload = json.dumps({
-        "title": (
-            f"DNS Setting Altered - {name}"
-        ),
-
-        "description": (
-            f"DNS configuration altered on "
-            f"{name} ({ip}). "
-            f"Detected DNS: {detected_dns}. "
-            f"Expected DNS: "
-            f"{', '.join(EXPECTED_DNS)}."
-        ),
-
-        "device_name": name,
-
-        "ip_address": ip,
-
-        "issue_type": ISSUE_TYPE,
-
+        "status": "resolved",
+        "resolution": f"DNS confirmed and restored to {', '.join(EXPECTED_DNS)}",
+        "updated_at": timestamp,
     }).encode()
-
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-
     if HELPDESK_TOKEN:
+        headers["Authorization"] = f"Bearer {HELPDESK_TOKEN}"
 
-        headers["Authorization"] = (
-            f"Bearer {HELPDESK_TOKEN}"
-        )
-
-    request = urllib.request.Request(
-        TICKET_URL,
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
-
-    try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=5,
-        ) as response:
-
-            raw = response.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
-            ticket = json.loads(raw)
-
-            print(
-                f"  [OK] DNS ticket created."
-            )
-
-            return ticket
-
-    except urllib.error.HTTPError as exc:
-
-        raw = exc.read().decode(
-            "utf-8",
-            errors="replace",
-        )
-
-        print(
-            f"  [WARN] DNS ticket creation failed: "
-            f"HTTP {exc.code}"
-        )
-
-        print(
-            f"         {raw.strip()}"
-        )
-
-        return None
-
-    except Exception as exc:
-
-        print(
-            f"  [WARN] DNS ticket creation failed: "
-            f"{exc}"
-        )
-
-        return None
-
-
-# ============================================================
-# DNS Remediation
-# ============================================================
-
-def correct_dns(device):
-    """
-    Restore the device DNS configuration to EXPECTED_DNS.
-
-    Returns:
-        True  -> correction and verification succeeded
-        False -> correction or verification failed
-    """
-
-    name = device["Device Name"]
-    ip = device["Device Address"]
-
-    os_type = device.get(
-        "OS",
-        "",
-    ).strip()
-
-    username = device.get(
-        "Username",
-        "",
-    ).strip()
-
-    password = device.get(
-        "Password",
-        "",
-    )
-
-    if os_type.lower() == "vyos":
-        port = VYOS_SSH_PORT
-    else:
-        port = 22
-
-    print(
-        f"\n  --- Correcting DNS Configuration "
-        f"on {name} ({ip}) ---"
-    )
-
-    # ========================================================
-    # VyOS
-    # ========================================================
-
-    if os_type.lower() == "vyos":
-
-        command = f"""
-/bin/vbash -ic '
-configure
-delete system name-server
-set system name-server {EXPECTED_DNS[0]}
-set system name-server {EXPECTED_DNS[1]}
-commit
-save
-exit
-'
-"""
-
-        success, output = run_ssh(
-            ip,
-            port,
-            username,
-            password,
-            command,
-        )
-
-        if not success:
-
-            print(
-                f"  [FAIL] Failed to modify DNS "
-                f"configuration on {name}."
-            )
-
-            print(
-                f"         {output.strip()}"
-            )
-
+    for method in ("PATCH", "PUT"):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=5):
+                return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 405 and method == "PATCH":
+                continue
             return False
-
-        print(
-            "  [OK] VyOS DNS configuration "
-            "command completed."
-        )
-
-        # Command used to verify actual VyOS config
-        verify_command = (
-            "/bin/vbash -ic "
-            "'show configuration commands | "
-            "match \"system name-server\"'"
-        )
-
-    # ========================================================
-    # Linux
-    # ========================================================
-
-    else:
-
-        resolv_content = "\\n".join(
-            f"nameserver {dns}"
-            for dns in EXPECTED_DNS
-        )
-
-        command = (
-            f"echo '{password}' | "
-            f"sudo -S sh -c "
-            f"'printf \"{resolv_content}\\n\" "
-            f"> /etc/resolv.conf'"
-        )
-
-        success, output = run_ssh(
-            ip,
-            port,
-            username,
-            password,
-            command,
-        )
-
-        if not success:
-
-            print(
-                f"  [FAIL] Failed to modify DNS "
-                f"configuration on {name}."
-            )
-
-            print(
-                f"         {output.strip()}"
-            )
-
+        except Exception:
             return False
-
-        print(
-            "  [OK] Linux DNS configuration "
-            "command completed."
-        )
-
-        verify_command = (
-            "cat /etc/resolv.conf"
-        )
-
-    # ========================================================
-    # Verify DNS
-    # ========================================================
-
-    verify_success, verify_output = run_ssh(
-        ip,
-        port,
-        username,
-        password,
-        verify_command,
-    )
-
-    if not verify_success:
-
-        print(
-            f"  [FAIL] DNS verification failed "
-            f"on {name}."
-        )
-
-        print(
-            f"         {verify_output.strip()}"
-        )
-
-        return False
-
-    print(
-        f"\n  --- Verified DNS Configuration "
-        f"on {name} ---"
-    )
-
-    print(
-        verify_output.strip()
-    )
-
-    # --------------------------------------------------------
-    # Extract IP addresses from verification output
-    # --------------------------------------------------------
-
-    verified_dns = re.findall(
-        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-        verify_output,
-    )
-
-    verified_dns = list(
-        dict.fromkeys(verified_dns)
-    )
-
-    # --------------------------------------------------------
-    # Compare verification result
-    # --------------------------------------------------------
-
-    if set(verified_dns) == set(EXPECTED_DNS):
-
-        print(
-            f"\n  [SUCCESS] {name} DNS restored to "
-            f"{', '.join(EXPECTED_DNS)}"
-        )
-
-        return True
-
-    print(
-        "\n  [FAIL] DNS verification does not "
-        "match expected configuration."
-    )
-
-    print(
-        f"  Expected: {', '.join(EXPECTED_DNS)}"
-    )
-
-    print(
-        f"  Detected: "
-        f"{', '.join(verified_dns) if verified_dns else 'None'}"
-    )
-
     return False
 
 
-# ============================================================
-# Helpdesk - Resolve Ticket
-# ============================================================
-
-def resolve_ticket(
-    ticket_id,
-    device,
-    timestamp,
-):
-    """
-    Mark the DNS ticket as resolved.
-
-    PATCH is attempted first.
-    PUT is used as a fallback if PATCH is unsupported.
-    """
-
-    url = (
-        f"{TICKET_URL}/{ticket_id}"
+def send_alert_email(device, current_dns, timestamp):
+    name, ip = device["Device Name"], device["Device Address"]
+    body = (
+        f"Dear Network Administrator,\n\n"
+        f"This is an automated alert that the DNS configuration for the following device has been altered from the expected settings:\n\n"
+        f"Device Name: {name}\n"
+        f"IP Address: {ip}\n"
+        f"Detected DNS Setting: {current_dns}\n"
+        f"Expected DNS Setting: {', '.join(EXPECTED_DNS)}\n"
+        f"Time Detected: {timestamp}\n\n"
+        f"The system will attempt to automatically correct this configuration.\n\n"
+        f"Best regards,\nNetwork Monitoring System"
     )
+    msg = MIMEMultipart()
+    msg["From"] = FROM_EMAIL
+    msg["To"] = TO_EMAIL
+    msg["Subject"] = f"DNS Configuration Alert: {name} ({ip})"
+    msg.attach(MIMEText(body, "plain"))
 
-    payload = json.dumps({
+    if not SEND_EMAIL or not SMTP_SERVER:
+        print("    --> [EMAIL] Alert prepared (dry run)")
+        return True
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as s:
+            s.send_message(msg)
+        print(f"    --> [EMAIL] Alert sent to {TO_EMAIL}")
+        return True
+    except Exception:
+        return False
 
-        "status": "resolved",
 
-        "resolution": (
-            f"DNS settings restored to "
-            f"{', '.join(EXPECTED_DNS)}"
-        ),
+def correct_dns(device):
+    name = device["Device Name"]
+    ip = device["Device Address"]
+    os_type = device.get("OS", "").strip().lower()
+    user = device.get("Username", "").strip()
+    pw = device.get("Password", "")
+    is_vyos = "vyos" in os_type or "router" in name.lower()
+    port = VYOS_SSH_PORT if is_vyos else 22
 
-        "resolved_time": timestamp,
-
-    }).encode()
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    if HELPDESK_TOKEN:
-
-        headers["Authorization"] = (
-            f"Bearer {HELPDESK_TOKEN}"
+    if is_vyos:
+        cmd = (
+            "/bin/vbash -ic '"
+            "source /opt/vyatta/etc/env.sh 2>/dev/null; "
+            "configure; "
+            "delete system name-server; "
+            f"set system name-server {EXPECTED_DNS[0]}; "
+            f"set system name-server {EXPECTED_DNS[1]}; "
+            "commit; save; exit'"
         )
+        verify_cmd = "/bin/vbash -ic 'show configuration commands | match \"system name-server\"'"
+    else:
+        lines = "".join(f"nameserver {dns}\\n" for dns in EXPECTED_DNS)
+        cmd = f"echo '{pw}' | sudo -S -p '' bash -c 'printf \"{lines}\" > /etc/resolv.conf'"
+        verify_cmd = "cat /etc/resolv.conf"
 
-    for method in (
-        "PATCH",
-        "PUT",
-    ):
+    success, _ = run_ssh(ip, port, user, pw, cmd, timeout=12)
+    if not success:
+        return False
 
-        request = urllib.request.Request(
-            url,
-            data=payload,
-            headers=headers,
-            method=method,
-        )
+    v_success, v_out = run_ssh(ip, port, user, pw, verify_cmd, timeout=10)
+    if not v_success:
+        return False
 
-        try:
-
-            with urllib.request.urlopen(
-                request,
-                timeout=5,
-            ) as response:
-
-                raw = response.read().decode(
-                    "utf-8",
-                    errors="replace",
-                )
-
-                try:
-                    ticket = json.loads(raw)
-                except json.JSONDecodeError:
-                    ticket = {
-                        "message": raw
-                    }
-
-                print(
-                    f"  [OK] Ticket #{ticket_id} "
-                    f"updated -> status: resolved"
-                )
-
-                print(
-                    f"       Device: "
-                    f"{device['Device Name']} "
-                    f"({device['Device Address']})"
-                )
-
-                return ticket
-
-        except urllib.error.HTTPError as exc:
-
-            # PATCH not supported.
-            # Try PUT instead.
-            if (
-                exc.code == 405
-                and method == "PATCH"
-            ):
-                continue
-
-            raw = exc.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
-            print(
-                f"  [WARN] Ticket #{ticket_id} "
-                f"update failed: HTTP {exc.code}"
-            )
-
-            if raw.strip():
-                print(
-                    f"         {raw.strip()}"
-                )
-
-            return None
-
-        except Exception as exc:
-
-            print(
-                f"  [WARN] Ticket #{ticket_id} "
-                f"update failed: {exc}"
-            )
-
-            return None
-
-    return None
+    verified = [dns for dns in list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", v_out))) if not dns.startswith("127.")]
+    return set(verified) == set(EXPECTED_DNS)
 
 
-# ============================================================
-# Display Tickets
-# ============================================================
+def show_ticket_entries(tickets):
+    print("\n" + "=" * 90)
+    print(f"{'ID':<6} {'Status':<12} {'Title':<30} {'Description':<40}")
+    print("-" * 90)
+    for t in tickets:
+        t_id = t.get("id") or t.get("ticket_id") or "?"
+        status = str(t.get("status", ""))[:10]
+        title = str(t.get("title", ""))[:28]
+        desc = str(t.get("description", ""))[:38]
+        print(f"{str(t_id):<6} {status:<12} {title:<30} {desc:<40}")
+    print("=" * 90)
 
-def show_ticket_entries(
-    tickets,
-):
-    """
-    Display DNS-related tickets for screenshot evidence.
-    """
-
-    print(
-        "\n"
-        + "=" * 90
-    )
-
-    print(
-        "WEB SERVICE TICKETS "
-        "(DNS COMPROMISE / RESOLVED)"
-    )
-
-    print(
-        "=" * 90
-    )
-
-    header = (
-        f"{'Ticket ID':<11} "
-        f"{'Device Name':<15} "
-        f"{'IP Address':<18} "
-        f"{'Status':<12} "
-        f"{'Issue Type':<20}"
-    )
-
-    print(header)
-
-    print(
-        "-" * len(header)
-    )
-
-    for ticket in tickets:
-
-        issue_type = str(
-            ticket.get(
-                "issue_type",
-                "",
-            )
-        )
-
-        # Only display DNS tickets here
-        if issue_type.lower() != ISSUE_TYPE.lower():
-            continue
-
-        ticket_id = (
-            ticket.get("ticket_id")
-            or ticket.get("id")
-            or "?"
-        )
-
-        device_name = ticket.get(
-            "device_name",
-            "",
-        )
-
-        ip_address = ticket.get(
-            "ip_address",
-            "",
-        )
-
-        status = ticket.get(
-            "status",
-            "",
-        )
-
-        print(
-            f"{str(ticket_id):<11} "
-            f"{str(device_name):<15} "
-            f"{str(ip_address):<18} "
-            f"{str(status):<12} "
-            f"{str(issue_type):<20}"
-        )
-
-    print(
-        "=" * 90
-    )
-
-
-# ============================================================
-# Main
-# ============================================================
 
 def main():
-
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     devices = get_monitored_devices()
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        "AUTOMATED DNS CONFIGURATION "
-        "MONITORING & REMEDIATION"
-    )
-
-    print(
-        f"Helpdesk API : {TICKET_URL}"
-    )
-
-    print(
-        f"Expected DNS : "
-        f"{', '.join(EXPECTED_DNS)}"
-    )
-
-    print(
-        f"Devices to scan: {len(devices)}"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    # --------------------------------------------------------
-    # Get current tickets
-    # --------------------------------------------------------
-
     tickets = get_tickets()
 
-    altered_count = 0
-    remediated_count = 0
-    failed_count = 0
-
-    # ========================================================
-    # Process devices
-    # ========================================================
+    print("=" * 60)
+    print(f"DNS MONITORING & REMEDIATION SCAN ({len(devices)} Devices)")
+    print("=" * 60)
 
     for device in devices:
-
         name = device["Device Name"]
         ip = device["Device Address"]
+        os_type = device.get("OS", "").strip().lower()
+        user = device.get("Username", "").strip()
+        pw = device.get("Password", "")
+        is_vyos = "vyos" in os_type or "router" in name.lower()
+        port = VYOS_SSH_PORT if is_vyos else 22
 
-        # ----------------------------------------------------
-        # 1. Detect altered DNS
-        # ----------------------------------------------------
-
-        current_dns = detect_altered_dns(
-            device
-        )
-
-        # DNS is correct or device unavailable
-        if current_dns is None:
+        if not ping_device(ip):
+            print(f"[-] {name:<8} ({ip:<15}) : OFFLINE (Skipped)")
             continue
 
-        altered_count += 1
+        cmd = "/bin/vbash -ic 'show configuration commands | match \"system name-server\"'" if is_vyos else "cat /etc/resolv.conf"
+        success, output = run_ssh(ip, port, user, pw, cmd)
 
-        print(
-            "\n"
-            + "=" * 70
-        )
+        if not success:
+            reason = "Port closed" if "connection refused" in str(output).lower() else "SSH Failed"
+            print(f"[!] {name:<8} ({ip:<15}) : {reason} (Skipped)")
+            continue
 
-        print(
-            f"REMEDIATING: {name} ({ip})"
-        )
+        detected = [dns for dns in list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", output))) if not dns.startswith("127.")]
 
-        print(
-            "=" * 70
-        )
+        # DNS is already correct
+        if set(detected) == set(EXPECTED_DNS):
+            print(f"[+] {name:<8} ({ip:<15}) : OK ({', '.join(detected)})")
 
-        # ----------------------------------------------------
-        # 2. Send DNS alert email
-        # ----------------------------------------------------
+            open_ticket = find_dns_ticket(tickets, device)
+            if open_ticket:
+                t_id = open_ticket.get("id") or open_ticket.get("ticket_id")
+                if resolve_ticket(t_id, timestamp):
+                    print(f"    --> [TICKET] Closed open ticket #{t_id} as RESOLVED")
+                    open_ticket["status"] = "resolved"
+            continue
 
-        subject, body = build_altered_email(
-            device,
-            current_dns,
-            ", ".join(EXPECTED_DNS),
-            timestamp,
-        )
+        # DNS is altered
+        current_dns = ", ".join(detected) if detected else "None detected"
+        print(f"[!] {name:<8} ({ip:<15}) : ALTERED ({current_dns})")
+        send_alert_email(device, current_dns, timestamp)
 
-        send_email(
-            subject,
-            body,
-        )
+        open_ticket = find_dns_ticket(tickets, device)
+        ticket_id = open_ticket.get("id") or open_ticket.get("ticket_id") if open_ticket else None
 
-        # ----------------------------------------------------
-        # 3. Find existing DNS ticket
-        # ----------------------------------------------------
+        if ticket_id:
+            print(f"    --> [TICKET] Found existing ticket #{ticket_id}")
 
-        ticket = find_dns_ticket(
-            tickets,
-            device,
-        )
-
-        ticket_id = None
-
-        if ticket:
-
-            ticket_id = (
-                ticket.get("ticket_id")
-                or ticket.get("id")
-            )
-
-            print(
-                f"\n  [OK] Existing DNS ticket found: "
-                f"#{ticket_id}"
-            )
-
+        print("    --> [REMEDIATE] Restoring DNS...", end=" ", flush=True)
+        if correct_dns(device):
+            print("SUCCESS")
+            if ticket_id and resolve_ticket(ticket_id, timestamp):
+                print(f"    --> [TICKET] #{ticket_id} updated to RESOLVED")
+                if open_ticket:
+                    open_ticket["status"] = "resolved"
         else:
+            print("FAILED")
 
-            print(
-                "\n  No open DNS Compromise ticket "
-                "found."
-            )
+    print("\nRefreshing ticket summary for submission evidence...")
+    show_ticket_entries(get_tickets())
 
-            print(
-                "  Creating a new DNS ticket..."
-            )
-
-            created_ticket = create_dns_ticket(
-                device,
-                current_dns,
-            )
-
-            if created_ticket:
-
-                ticket_id = (
-                    created_ticket.get(
-                        "ticket_id"
-                    )
-                    or created_ticket.get(
-                        "id"
-                    )
-                )
-
-                if ticket_id:
-
-                    print(
-                        f"  [OK] Using new DNS "
-                        f"ticket #{ticket_id}"
-                    )
-
-                    # Add newly created ticket to our
-                    # local ticket list so future devices
-                    # can see it during this execution.
-                    tickets.append(
-                        created_ticket
-                    )
-
-        # ----------------------------------------------------
-        # 4. Correct DNS
-        # ----------------------------------------------------
-
-        remediated = correct_dns(
-            device
-        )
-
-        # ----------------------------------------------------
-        # 5. Only resolve after successful verification
-        # ----------------------------------------------------
-
-        if not remediated:
-
-            failed_count += 1
-
-            print(
-                f"\n  [FAIL] DNS remediation failed "
-                f"for {name}."
-            )
-
-            print(
-                "  The DNS ticket will remain open."
-            )
-
-            continue
-
-        remediated_count += 1
-
-        # ----------------------------------------------------
-        # 6. Resolve DNS ticket
-        # ----------------------------------------------------
-
-        if ticket_id is None:
-
-            print(
-                "\n  [WARN] DNS was successfully "
-                "corrected, but no ticket ID "
-                "is available to resolve."
-            )
-
-            continue
-
-        print(
-            "\n  --- Updating DNS Ticket "
-            "in Web Service ---"
-        )
-
-        resolve_ticket(
-            ticket_id,
-            device,
-            timestamp,
-        )
-
-    # ========================================================
-    # Summary
-    # ========================================================
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "SCAN COMPLETE"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"DNS altered devices : {altered_count}"
-    )
-
-    print(
-        f"Successfully fixed  : {remediated_count}"
-    )
-
-    print(
-        f"Failed remediation  : {failed_count}"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    # --------------------------------------------------------
-    # Refresh tickets for screenshot evidence
-    # --------------------------------------------------------
-
-    updated_tickets = get_tickets()
-
-    if updated_tickets:
-
-        show_ticket_entries(
-            updated_tickets
-        )
-
-
-# ============================================================
-# Entry Point
-# ============================================================
 
 if __name__ == "__main__":
     main()
