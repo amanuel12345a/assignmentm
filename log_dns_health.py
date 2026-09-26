@@ -31,7 +31,7 @@ def get_device_dns(ssh_client):
 def main():
     devices = enumerate_devices(CSV_FILE)
     
-    with open(LOG_FILE, "w") as f:
+    with open(LOG_FILE, "a") as f:
         for dev in devices:
             name = dev["Device Name"].strip()
             ip = dev["Device Address"].strip()
