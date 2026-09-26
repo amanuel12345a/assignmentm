@@ -236,7 +236,7 @@ def main():
             )
 
             current_dns = get_device_dns(ssh)
-            is_compliant = all(srv in current_dns for srv in EXPECTED_DNS)
+            is_compliant = set(current_dns) == set(EXPECTED_DNS)
 
             if not is_compliant:
                 print(f"\n[!] ALERT: DNS configuration altered on {name} ({ip})!")
